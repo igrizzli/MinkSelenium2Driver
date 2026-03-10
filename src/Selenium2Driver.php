@@ -448,7 +448,18 @@ class Selenium2Driver extends CoreDriver
 
     public function switchToIFrame(?string $name = null)
     {
-        $this->getWebDriverSession()->frame(array('id' => $name));
+        if ($name === null) {
+            $this->getWebDriverSession()->frame(array('id' => null));
+        } else {
+            // W3C WebDriver doesn't allow string frame name directly.
+            // Find the frame/iframe element by name or id attribute and pass element reference.
+            $selector = sprintf(
+                'iframe[name="%1$s"], frame[name="%1$s"], iframe[id="%1$s"], frame[id="%1$s"]',
+                $name
+            );
+            $frameElement = $this->getWebDriverSession()->element('css selector', $selector);
+            $this->getWebDriverSession()->frame(array('id' => array(Element::WEB_ELEMENT_ID => $frameElement->getID())));
+        }
     }
 
     public function setCookie(string $name, ?string $value = null)
@@ -510,12 +521,12 @@ class Selenium2Driver extends CoreDriver
 
     public function getWindowNames()
     {
-        return $this->getWebDriverSession()->window_handles();
+        return $this->getWebDriverSession()->window()->handles();
     }
 
     public function getWindowName()
     {
-        return $this->getWebDriverSession()->window_handle();
+        return $this->getWebDriverSession()->getWindowHandle();
     }
 
     /**
@@ -690,7 +701,13 @@ JS;
 
         if (in_array($elementName, array('input', 'textarea'))) {
             $existingValueLength = strlen($element->attribute('value'));
-            $value = str_repeat(Key::BACKSPACE . Key::DELETE, $existingValueLength) . $value;
+            if ($existingValueLength > 0) {
+                $value = str_repeat(Key::BACKSPACE . Key::DELETE, $existingValueLength) . $value;
+            } else {
+                // For fields where attribute('value') returns empty (e.g. password fields in newer Chrome),
+                // use clear() to ensure the field is emptied before typing
+                $element->clear();
+            }
         }
 
         $element->postValue(array('text' => $value));
@@ -783,7 +800,29 @@ JS;
             // Move the mouse to the element as Selenium does not allow clicking on an element which is outside the viewport
             $this->getWebDriverSession()->moveto(array('element' => $element->getID()));
         } catch (UnknownCommand $e) {
-            // If the Webdriver implementation does not support moveto (which is not part of the W3C WebDriver spec), proceed to the click
+            // W3C WebDriver: use Actions API instead of legacy moveto
+            try {
+                $this->getWebDriverSession()->postActions(array(
+                    'actions' => array(
+                        array(
+                            'type' => 'pointer',
+                            'id' => 'mouse',
+                            'parameters' => array('pointerType' => 'mouse'),
+                            'actions' => array(
+                                array(
+                                    'type' => 'pointerMove',
+                                    'duration' => 0,
+                                    'origin' => array(Element::WEB_ELEMENT_ID => $element->getID()),
+                                    'x' => 0,
+                                    'y' => 0,
+                                ),
+                            ),
+                        ),
+                    ),
+                ));
+            } catch (\Exception $e) {
+                // If Actions API also fails, proceed to click anyway
+            }
         } catch (UnknownError $e) {
             // Chromium driver sends back UnknownError (WebDriver\Exception with code 13)
         }
@@ -793,14 +832,56 @@ JS;
 
     public function doubleClick(string $xpath)
     {
-        $this->mouseOver($xpath);
-        $this->getWebDriverSession()->doubleclick();
+        $element = $this->findElement($xpath);
+        try {
+            $this->mouseOver($xpath);
+            $this->getWebDriverSession()->doubleclick();
+        } catch (UnknownCommand $e) {
+            // W3C WebDriver: use Actions API
+            $origin = array(Element::WEB_ELEMENT_ID => $element->getID());
+            $this->getWebDriverSession()->postActions(array(
+                'actions' => array(
+                    array(
+                        'type' => 'pointer',
+                        'id' => 'mouse',
+                        'parameters' => array('pointerType' => 'mouse'),
+                        'actions' => array(
+                            array('type' => 'pointerMove', 'duration' => 0, 'origin' => $origin, 'x' => 0, 'y' => 0),
+                            array('type' => 'pointerDown', 'button' => 0),
+                            array('type' => 'pointerUp', 'button' => 0),
+                            array('type' => 'pointerDown', 'button' => 0),
+                            array('type' => 'pointerUp', 'button' => 0),
+                        ),
+                    ),
+                ),
+            ));
+        }
     }
 
     public function rightClick(string $xpath)
     {
-        $this->mouseOver($xpath);
-        $this->getWebDriverSession()->click(array('button' => 2));
+        $element = $this->findElement($xpath);
+        try {
+            $this->mouseOver($xpath);
+            $this->getWebDriverSession()->click(array('button' => 2));
+        } catch (UnknownCommand $e) {
+            // W3C WebDriver: use Actions API for right click
+            $origin = array(Element::WEB_ELEMENT_ID => $element->getID());
+            $this->getWebDriverSession()->postActions(array(
+                'actions' => array(
+                    array(
+                        'type' => 'pointer',
+                        'id' => 'mouse',
+                        'parameters' => array('pointerType' => 'mouse'),
+                        'actions' => array(
+                            array('type' => 'pointerMove', 'duration' => 0, 'origin' => $origin, 'x' => 0, 'y' => 0),
+                            array('type' => 'pointerDown', 'button' => 2),
+                            array('type' => 'pointerUp', 'button' => 2),
+                        ),
+                    ),
+                ),
+            ));
+        }
     }
 
     public function attachFile(string $xpath, string $path)
@@ -818,7 +899,7 @@ JS;
           $remotePath = $path;
         }
 
-        $element->postValue(array('value' => array($remotePath)));
+        $element->postValue(array('text' => $remotePath));
     }
 
     public function isVisible(string $xpath)
@@ -828,9 +909,33 @@ JS;
 
     public function mouseOver(string $xpath)
     {
-        $this->getWebDriverSession()->moveto(array(
-            'element' => $this->findElement($xpath)->getID()
-        ));
+        $element = $this->findElement($xpath);
+
+        try {
+            $this->getWebDriverSession()->moveto(array(
+                'element' => $element->getID()
+            ));
+        } catch (UnknownCommand $e) {
+            // W3C WebDriver: use Actions API instead of legacy moveto
+            $this->getWebDriverSession()->postActions(array(
+                'actions' => array(
+                    array(
+                        'type' => 'pointer',
+                        'id' => 'mouse',
+                        'parameters' => array('pointerType' => 'mouse'),
+                        'actions' => array(
+                            array(
+                                'type' => 'pointerMove',
+                                'duration' => 0,
+                                'origin' => array(Element::WEB_ELEMENT_ID => $element->getID()),
+                                'x' => 0,
+                                'y' => 0,
+                            ),
+                        ),
+                    ),
+                ),
+            ));
+        }
     }
 
     public function focus(string $xpath)
@@ -866,11 +971,12 @@ JS;
         $source      = $this->findElement($sourceXpath);
         $destination = $this->findElement($destinationXpath);
 
-        $this->getWebDriverSession()->moveto(array(
-            'element' => $source->getID()
-        ));
+        try {
+            $this->getWebDriverSession()->moveto(array(
+                'element' => $source->getID()
+            ));
 
-        $script = <<<JS
+            $script = <<<JS
 (function (element) {
     var event = document.createEvent("HTMLEvents");
 
@@ -880,15 +986,15 @@ JS;
     element.dispatchEvent(event);
 }({{ELEMENT}}));
 JS;
-        $this->withSyn()->executeJsOnElement($source, $script);
+            $this->withSyn()->executeJsOnElement($source, $script);
 
-        $this->getWebDriverSession()->buttondown();
-        $this->getWebDriverSession()->moveto(array(
-            'element' => $destination->getID()
-        ));
-        $this->getWebDriverSession()->buttonup();
+            $this->getWebDriverSession()->buttondown();
+            $this->getWebDriverSession()->moveto(array(
+                'element' => $destination->getID()
+            ));
+            $this->getWebDriverSession()->buttonup();
 
-        $script = <<<JS
+            $script = <<<JS
 (function (element) {
     var event = document.createEvent("HTMLEvents");
 
@@ -898,7 +1004,29 @@ JS;
     element.dispatchEvent(event);
 }({{ELEMENT}}));
 JS;
-        $this->withSyn()->executeJsOnElement($destination, $script);
+            $this->withSyn()->executeJsOnElement($destination, $script);
+        } catch (UnknownCommand $e) {
+            // W3C WebDriver: use Actions API for drag and drop
+            $sourceOrigin = array(Element::WEB_ELEMENT_ID => $source->getID());
+            $destOrigin = array(Element::WEB_ELEMENT_ID => $destination->getID());
+
+            $this->getWebDriverSession()->postActions(array(
+                'actions' => array(
+                    array(
+                        'type' => 'pointer',
+                        'id' => 'mouse',
+                        'parameters' => array('pointerType' => 'mouse'),
+                        'actions' => array(
+                            array('type' => 'pointerMove', 'duration' => 0, 'origin' => $sourceOrigin, 'x' => 0, 'y' => 0),
+                            array('type' => 'pointerDown', 'button' => 0),
+                            array('type' => 'pause', 'duration' => 100),
+                            array('type' => 'pointerMove', 'duration' => 250, 'origin' => $destOrigin, 'x' => 0, 'y' => 0),
+                            array('type' => 'pointerUp', 'button' => 0),
+                        ),
+                    ),
+                ),
+            ));
+        }
     }
 
     public function executeScript(string $script)
